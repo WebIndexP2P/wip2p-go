@@ -1,0 +1,6 @@
+*.exe
+wip2p-go
+wip2p.db.lock
+/testdata
+/release
+/*.db

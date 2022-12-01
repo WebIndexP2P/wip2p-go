@@ -1,0 +1,284 @@
+package clientsession
+
+import (
+  //"fmt"
+  "log"
+  "sort"
+  "bytes"
+  "errors"
+  "strconv"
+  "encoding/hex"
+
+  "github.com/ipfs/go-cid"
+  "github.com/ipfs/go-ipld-cbor"
+  mh "github.com/multiformats/go-multihash"
+  "github.com/ethereum/go-ethereum/common"
+
+  "code.wip2p.com/mwadmin/wip2p-go/db"
+  "code.wip2p.com/mwadmin/wip2p-go/sigbundle"
+  "code.wip2p.com/mwadmin/wip2p-go/merklehead"
+  "code.wip2p.com/mwadmin/wip2p-go/core/globals"
+)
+
+func (s *Session) StartMerkleheadSwap() {
+
+  log.Fatal("deprecated")
+  //  Notes
+  // dont send any pastes at a level below our sync level
+  // pastes coming in at our sync level or higher can be updated
+
+  // Get our root merklehead doc
+  var rootMerklehead map[string]interface{}
+
+  if merklehead.Merklehead != nil {
+    rootMerklehead = FetchMerkleheadRootDoc()
+  }
+
+  // request merklehead levelmap doc using remote multihash
+  tmpCid := cid.NewCidV1(0x71, s.RemoteMerklehead)
+  remoteRootDoc, err := s.RequestDocFromPeer(tmpCid)
+  if err != nil {
+    log.Println("Sync failed requesting doc from peer")
+    return
+  }
+
+  //log.Printf("Got doc response from remote peer %+v\n", doc)
+
+  // compare "0" timestamp
+  remoteMerkleheadIface, _, _ := remoteRootDoc.Resolve(nil)
+  remoteMerklehead, ok := remoteMerkleheadIface.(map[string]interface{})
+  if !ok {
+    // no invites
+    log.Println("Merklehead doc returned by peer looks invalid")
+    return
+  }
+
+  // compare timestamps of root account
+  bShouldGetRootFromRemote := false
+  if rootMerklehead == nil {
+    bShouldGetRootFromRemote = true
+  } else {
+    ourRootAccountTimestamp := rootMerklehead["0"].(uint64)
+    remoteRootAccountTimestamp := remoteMerklehead["0"].(uint64)
+    if remoteRootAccountTimestamp > ourRootAccountTimestamp {
+      bShouldGetRootFromRemote = true
+    }
+  }
+  if bShouldGetRootFromRemote {
+    bundle, err := s.RequestSignedBundleFromPeer(globals.RootAccount[:])
+    if err != nil {
+      log.Printf("request bundle error: %+v\n", err)
+      return
+    }
+    bundle.Account = common.BytesToAddress(globals.RootAccount[:]).String()
+    tmpSigBundle, err := bundle.ToSigBundle()
+    if err != nil {
+      log.Printf("bundle convertsion error: %+v\n", err)
+      return
+    }
+    _, _, err = sigbundle.ValidateAndSave(*tmpSigBundle, nil)
+    if err != nil {
+      log.Printf("bundle_save error: %+v\n", err)
+    }
+  }
+  // end of root check
+
+  rootMerkleheadCid := merklehead.Merklehead
+
+  sortedLevels := make([]int, 0)
+  for key, _ := range remoteMerklehead {
+    keyInt, _ := strconv.Atoi(key)
+    if keyInt == 0 {
+      continue
+    }
+    sortedLevels = append(sortedLevels, keyInt)
+  }
+  sort.Ints(sortedLevels)
+
+  for _, levelKey := range sortedLevels {
+
+    // refresh merklehead if need be
+    if bytes.Equal(rootMerkleheadCid, merklehead.Merklehead) == false {
+      rootMerklehead = FetchMerkleheadRootDoc()
+      rootMerkleheadCid = merklehead.Merklehead
+    }
+
+    sLvl := strconv.Itoa(levelKey)
+    var ourCid cid.Cid
+
+    remoteCid, ok := remoteMerklehead[sLvl].(cid.Cid)
+    if !ok {
+      // this will always skip level 0 as its not a cid
+      continue
+    }
+
+    // compare each level cid against ours
+    if rootMerklehead == nil {
+      // dont do any cid check
+    } else {
+      ourCid, ok = rootMerklehead[sLvl].(cid.Cid)
+      if ok && ourCid.Equals(remoteCid) {
+        continue
+      }
+    }
+
+    s.RecurseAccountIndex(remoteCid, ourCid)
+
+    // go to next level, tell remote moving to level 1, remote responds with latest cid (could be different to levelmap due to updates)
+    // remote can stream live updates from lvl 0 & lvl 1 accounts to keep peers syncd
+    // iterate and download all accounts for lvl
+  }
+}
+
+func (s *Session) RecurseAccountIndex(targetCid cid.Cid, ourCid cid.Cid) error {
+
+  //log.Printf("RecurseAccountIndex: %v %v\n", targetCid, ourCid)
+
+  var ourIndex map[string]interface{}
+
+  if len(ourCid.Hash()) > 0 {
+    // get our own doc first
+    docLib := db.Doc{}
+    ourIndexDoc, success := docLib.Get(ourCid.Hash(), nil)
+    if !success {
+      panic("problem fetching doc from db")
+    }
+    ourIndexNode, err := cbornode.Decode(ourIndexDoc.Data, mh.SHA2_256, mh.DefaultLengths[mh.SHA2_256])
+    if err != nil {
+      panic("could not decode our own merklehead index")
+    }
+    ourIndexIface, _, _ := ourIndexNode.Resolve(nil)
+    ourIndex = ourIndexIface.(map[string]interface{})
+  }
+
+  doc, err := s.RequestDocFromPeer(targetCid)
+  if err != nil {
+    log.Println("Doc request from peer failed")
+    return errors.New("Doc request from peer failed")
+  }
+
+  objIface, _, _ := doc.Resolve(nil)
+  obj, ok := objIface.(map[string]interface{})
+  if !ok {
+    log.Println("Merklehead index returned by peer looks invalid")
+    return errors.New("Merklehead index returned by peer looks invalid")
+  }
+
+  keys := make([]string, 0)
+  for key := range obj {
+    keys = append(keys, key)
+  }
+  sort.Strings(keys)
+
+  for _, key := range keys {
+
+    if len(key) == 1 {
+      log.Fatal("not used yet")
+      // its a cid link
+      linkCid, ok := obj[key].(cid.Cid)
+      if !ok {
+        log.Println("expected cid link")
+        return errors.New("expected cid link")
+      }
+      return s.RecurseAccountIndex(linkCid, ourCid)
+    } else {
+      // its a timestamp, will need to compare it
+      /*providedTimestamp := uint64(obj[key].(float64))
+      if providedTimestamp <= ourTimestamp {
+        continue
+      }*/
+
+      remoteTimestamp, ok := obj[key].(uint64)
+      if !ok {
+        continue
+      }
+
+      // compare each level cid against ours
+      if ourIndex == nil {
+        // dont do any cid check
+      } else {
+        ourTimestamp, ok := ourIndex[key].(uint64)
+        if !ok {
+          // check we have the account and the lvl matches
+          //acctB, _ := hex.DecodeString(key)
+          //acct := common.BytesToAddress(acctB)
+          //tmpAcct, found := account.FetchAccountFromDb(acct, nil, false)
+          //if !found || tmpAcct.RootMultihash != nil {
+          //  log.Printf("consensus bug against remote node")
+          //  continue
+          //}
+        } else {
+          if ourTimestamp >= remoteTimestamp {
+            continue
+          }
+        }
+        //log.Printf("key: %v ours: %v remote: %v\n", key, ourTimestamp, remoteTimestamp)
+      }
+
+      acct, _ := hex.DecodeString(key)
+      bundle, err := s.RequestSignedBundleFromPeer(acct)
+      if err != nil {
+        log.Printf("peer responded with error: %v\nfor account: %s", err, key)
+        continue
+      }
+      bundle.Account = common.BytesToAddress(acct).String()
+      sigBundle, err := bundle.ToSigBundle()
+      if err != nil {
+        log.Printf("bundle conversion error: %s", err)
+        continue
+      }
+
+      _, _, err = sigbundle.ValidateAndSave(*sigBundle, nil)
+      if err != nil {
+        log.Printf("bundle_save error: %+v\n", err)
+      }
+    }
+  }
+
+  return nil
+}
+
+func (s *Session) RequestDocFromPeer(cid cid.Cid) (*cbornode.Node, error) {
+
+  if len(cid.Hash()) == 0 {
+    panic("cid is nil")
+  }
+
+  var doc *cbornode.Node
+  waitchan := make(chan error)
+  s.SendRPC("doc_get", []interface{}{cid.String()}, func(result interface{}, err error){
+    if err != nil {
+      log.Printf("%+v\n", err)
+      waitchan <- err
+    }
+    docB, _ := hex.DecodeString(result.(string)[2:])
+    doc, err = cbornode.Decode(docB, mh.SHA2_256, mh.DefaultLengths[mh.SHA2_256])
+    waitchan <- nil
+  })
+  err := <- waitchan
+  return doc, err
+}
+
+func FetchMerkleheadRootDoc() map[string]interface{} {
+  doc := db.Doc{}
+  rootMerklehead := map[string]interface{}{}
+
+  rootDoc, success := doc.Get(merklehead.Merklehead, nil)
+  if !success {
+    log.Printf("%+v\n", merklehead.Merklehead)
+    panic("merklehead doc not found in db")
+  }
+  rootMerkleheadNode, err := cbornode.Decode(rootDoc.Data, mh.SHA2_256, mh.DefaultLengths[mh.SHA2_256])
+  if err != nil {
+    panic(err)
+  }
+
+  rootMerkleheadIface, _, _ := rootMerkleheadNode.Resolve(nil)
+  var ok bool
+  rootMerklehead, ok = rootMerkleheadIface.(map[string]interface{})
+  if !ok {
+    panic("Merklehead root doc problem")
+  }
+
+  return rootMerklehead
+}
